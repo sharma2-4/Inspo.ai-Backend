@@ -1,0 +1,1042 @@
+require("dotenv").config();
+const express = require("express");
+const axios = require("axios");
+const cors = require("cors");
+const cheerio = require("cheerio");
+const color = require("color");
+const puppeteer = require("puppeteer");
+const { setTimeout } = require("timers/promises");
+
+const app = express();
+app.use(cors());
+app.use(express.json());
+app.use(express.urlencoded({ extended: true }));
+
+// Validate environment variables
+if (!process.env.GEMINI_API_KEY || !process.env.SERPAPI_KEY) {
+  console.error("❌ ERROR: Missing API keys in .env file!");
+  process.exit(1);
+}
+
+// Browser instance for scraping
+let browser;
+async function initBrowser() {
+  browser = await puppeteer.launch({
+    headless: true,
+    args: ['--no-sandbox', '--disable-setuid-sandbox', '--disable-dev-shm-usage']
+  });
+  console.log("✅ Browser instance initialized");
+}
+initBrowser().catch(err => console.error("❌ Browser initialization failed:", err));
+
+// Enhanced AI design suggestions with granular filters
+const getDesignSuggestions = async (query, industry, font, colorHex, designStyle, audience, purpose) => {
+  try {
+    const url = `https://generativelanguage.googleapis.com/v1/models/gemini-1.5-flash:generateContent?key=${process.env.GEMINI_API_KEY}`;
+    
+    // Create a more specific prompt including all user preferences
+    const prompt = `
+      As a senior design consultant with expertise in ${industry || 'various industries'}, provide detailed design recommendations for a project with these specifications:
+      
+      PROJECT DETAILS:
+      - Design Query: "${query}"
+      - Industry: "${industry || 'Not specified'}"
+      - Font Type: "${font || 'Not specified'}"
+      - Primary Color: "${colorHex || 'Not specified'}"
+      - Design Style: "${designStyle || 'Not specified'}"
+      - Target Audience: "${audience || 'Not specified'}"
+      - Purpose: "${purpose || 'Not specified'}"
+      
+      In your response, include:
+      
+      1. COLOR PALETTE:
+         - 5 complementary colors with hex codes
+         - Primary, secondary, accent, and neutral colors identified
+         - Psychological impact of each color on the target audience
+      
+      2. TYPOGRAPHY:
+         - Specific headline font recommendation (not generic)
+         - Specific body font recommendation that pairs well with the headline font
+         - Recommended font sizes and weights for different elements
+      
+      3. LAYOUT ELEMENTS:
+         - 3 specific layout structures that would work best for this ${industry || ''} design
+         - Key visual elements to include (icons, illustrations, photos, etc.)
+         - Whitespace and grid recommendations
+      
+      4. DESIGN PRINCIPLES:
+         - How to maintain consistency across the design
+         - Accessibility considerations for the target audience
+         - Emotional response the design should evoke
+      
+      Format your response in a clear, structured manner a designer could immediately implement.
+    `;
+    
+    const payload = {
+      contents: [{ parts: [{ text: prompt }] }],
+      generationConfig: {
+        temperature: 0.2,
+        topK: 40,
+        topP: 0.95,
+        maxOutputTokens: 2048,
+      }
+    };
+
+    const response = await axios.post(url, payload, {
+      headers: { "Content-Type": "application/json" }
+    });
+    return response.data.candidates?.[0]?.content?.parts?.[0]?.text || "No AI suggestions available.";
+  } catch (error) {
+    console.error("❌ Gemini API Error:", error.response?.data || error.message);
+    return "Could not generate AI suggestions due to an error.";
+  }
+};
+
+// Enhanced scraping function for Dribbble with more granular filters
+const scrapeDribbble = async (query, limit = 4, colorHex = null, designStyle = null) => {
+  try {
+    // Build a more specific query
+    let searchQuery = query;
+    if (designStyle) searchQuery += ` ${designStyle}`;
+    
+    const url = `https://dribbble.com/search/shots?q=${encodeURIComponent(searchQuery)}`;
+    const browser = await puppeteer.launch({ headless: true });
+    const page = await browser.newPage();
+    await page.goto(url, { waitUntil: 'networkidle2' });
+    
+    // Extract results
+    const results = await page.evaluate((limit, colorHex) => {
+      const shots = document.querySelectorAll('.shot-thumbnail');
+      const data = [];
+      
+      for (let i = 0; i < Math.min(shots.length, limit * 2); i++) {
+        const shot = shots[i];
+        const imageEl = shot.querySelector('img');
+        if (!imageEl) continue;
+        
+        const image = imageEl.src;
+        const title = shot.querySelector('.shot-title')?.textContent.trim() || 'Dribbble Design';
+        const designer = shot.querySelector('.display-name')?.textContent.trim() || 'Unknown Designer';
+        const link = shot.querySelector('a')?.href || '';
+        
+        // Get color information from shot if available
+        const colors = shot.querySelectorAll('.color-chip');
+        const shotColors = Array.from(colors).map(c => c.style.backgroundColor || '');
+        
+        // If color filter is provided, skip shots that don't match
+        if (colorHex && shotColors.length > 0) {
+          const hexColor = colorHex.toLowerCase();
+          const colorMatch = shotColors.some(c => {
+            return c.toLowerCase().includes(hexColor.replace('#', ''));
+          });
+          if (!colorMatch && data.length >= limit / 2) continue;
+        }
+        
+        data.push({ image, title, designer, link, source: "Dribbble", colors: shotColors });
+        if (data.length >= limit) break;
+      }
+      
+      return data;
+    }, limit, colorHex);
+    
+    await browser.close();
+    return results;
+  } catch (error) {
+    console.error("❌ Dribbble Scraping Error:", error.message);
+    return [];
+  }
+};
+
+// New function to scrape Designspiration
+const scrapeDesignspiration = async (query, limit = 3) => {
+  if (!browser) await initBrowser();
+  
+  try {
+    const page = await browser.newPage();
+    await page.setUserAgent('Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/91.0.4472.124 Safari/537.36');
+    
+    const url = `https://www.designspiration.com/search/saves/?q=${encodeURIComponent(query)}`;
+    await page.goto(url, { waitUntil: 'networkidle2', timeout: 30000 });
+    
+    // Wait for the content to load
+    await page.waitForSelector('.gridItem', { timeout: 10000 }).catch(() => {});
+    
+    const results = await page.evaluate((limit) => {
+      const items = document.querySelectorAll('.gridItem');
+      const data = [];
+      
+      for (let i = 0; i < Math.min(items.length, limit); i++) {
+        const item = items[i];
+        
+        const imageEl = item.querySelector('img');
+        if (!imageEl) continue;
+        
+        const image = imageEl.src;
+        const link = item.querySelector('a')?.href || '';
+        const title = "Designspiration Design";
+        
+        // Extract color palette if available
+        const colorElements = item.querySelectorAll('.colorItem');
+        const colors = Array.from(colorElements).map(el => {
+          const style = el.getAttribute('style');
+          const match = style?.match(/background-color: (#[0-9a-f]{6})/i);
+          return match ? match[1] : null;
+        }).filter(Boolean);
+        
+        data.push({ 
+          image, 
+          title, 
+          link,
+          colors,
+          source: "Designspiration" 
+        });
+      }
+      
+      return data;
+    }, limit);
+    
+    await page.close();
+    return results;
+  } catch (error) {
+    console.error("❌ Designspiration Scraping Error:", error.message);
+    return [];
+  }
+};
+
+// New function to scrape Muzli
+const scrapeMuzli = async (query, limit = 3) => {
+  if (!browser) await initBrowser();
+  
+  try {
+    const page = await browser.newPage();
+    await page.setUserAgent('Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/91.0.4472.124 Safari/537.36');
+    
+    // Muzli doesn't have a direct search, so we'll use their curated content
+    const url = 'https://muz.li/';
+    await page.goto(url, { waitUntil: 'networkidle2', timeout: 30000 });
+    
+    // Filter content based on query
+    const results = await page.evaluate((query, limit) => {
+      const items = document.querySelectorAll('.grid-item');
+      const data = [];
+      
+      // Convert query to lowercase for case-insensitive matching
+      const queryLower = query.toLowerCase();
+      const queryWords = queryLower.split(' ');
+      
+      for (let i = 0; i < items.length; i++) {
+        const item = items[i];
+        
+        const imageEl = item.querySelector('img');
+        if (!imageEl) continue;
+        
+        const image = imageEl.src;
+        const titleEl = item.querySelector('.title');
+        const title = titleEl ? titleEl.textContent.trim() : 'Muzli Design';
+        const link = item.querySelector('a')?.href || '';
+        
+        // Simple relevance filter - check if any query word is in the title
+        const titleLower = title.toLowerCase();
+        const isRelevant = queryWords.some(word => titleLower.includes(word));
+        
+        // Only add if relevant or if we don't have enough items yet
+        if (isRelevant || data.length < limit / 2) {
+          data.push({ 
+            image, 
+            title,
+            link, 
+            source: "Muzli"
+          });
+        }
+        
+        if (data.length >= limit) break;
+      }
+      
+      return data;
+    }, query, limit);
+    
+    await page.close();
+    return results;
+  } catch (error) {
+    console.error("❌ Muzli Scraping Error:", error.message);
+    return [];
+  }
+};
+
+// New function to scrape Instagram hashtags
+const scrapeInstagram = async (query, limit = 2) => {
+  if (!browser) await initBrowser();
+  
+  try {
+    // Convert query to a hashtag by keeping only alphanumeric chars
+    const hashtag = query.replace(/[^a-zA-Z0-9]/g, '').toLowerCase();
+    
+    const page = await browser.newPage();
+    await page.setUserAgent('Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/91.0.4472.124 Safari/537.36');
+    
+    const url = `https://www.instagram.com/explore/tags/${encodeURIComponent(hashtag)}/`;
+    await page.goto(url, { waitUntil: 'networkidle2', timeout: 30000 });
+    
+    // Wait for some content to load
+    await page.waitForSelector('article img', { timeout: 10000 }).catch(() => {});
+    
+    // Instagram loads content dynamically, so we'll scroll down a bit
+    await page.evaluate(() => {
+      window.scrollBy(0, 1000);
+    });
+    
+    await page.waitForTimeout(2000);
+    
+    const results = await page.evaluate((limit) => {
+      const posts = document.querySelectorAll('article img');
+      const data = [];
+      
+      for (let i = 0; i < Math.min(posts.length, limit); i++) {
+        const post = posts[i];
+        const image = post.src;
+        const alt = post.alt || 'Instagram Design Inspiration';
+        
+        // Only add if we have an image
+        if (image) {
+          data.push({ 
+            image, 
+            title: alt,
+            source: "Instagram"
+          });
+        }
+      }
+      
+      return data;
+    }, limit);
+    
+    await page.close();
+    return results;
+  } catch (error) {
+    console.error("❌ Instagram Scraping Error:", error.message);
+    return [];
+  }
+};
+
+// Enhanced SerpAPI function with more granular filters
+const fetchSerpAPIImages = async (query, limit = 3, colorHex = null, designStyle = null, filters = {}) => {
+  try {
+    // Enhance the query with more specific parameters
+    let enhancedQuery = query;
+    
+    if (designStyle) enhancedQuery += ` ${designStyle} style`;
+    
+    // Add color filter if provided
+    if (colorHex) {
+      try {
+        const colorObj = color(colorHex);
+        const colorName = colorObj.keyword() || "";
+        if (colorName) enhancedQuery += ` ${colorName}`;
+      } catch (e) {
+        // If color parsing fails, just use the original query
+      }
+    }
+    
+    // Add industry filter if provided
+    if (filters.industry) enhancedQuery += ` ${filters.industry} industry`;
+    
+    // Add audience filter if provided
+    if (filters.audience) enhancedQuery += ` for ${filters.audience}`;
+    
+    const params = { 
+      q: enhancedQuery, 
+      tbm: "isch", 
+      api_key: process.env.SERPAPI_KEY,
+      ijn: "0",
+      safe: "active"
+    };
+    
+    // Add specific image size filter if provided
+    if (filters.imageSize) {
+      params.tbs = `isz:${filters.imageSize}`;
+    }
+    
+    const response = await axios.get("https://serpapi.com/search.json", { params });
+
+    return response.data.images_results.slice(0, limit).map((img) => ({
+      image: img.original,
+      title: img.title || "Design Inspiration",
+      source: "Google Images",
+      link: img.source
+    }));
+  } catch (error) {
+    console.error("❌ SerpAPI Error:", error.message);
+    return [];
+  }
+};
+
+// Enhanced function to get related design terms
+const getRelatedDesignTerms = async (query, industry, designStyle, audience) => {
+  try {
+    const url = `https://generativelanguage.googleapis.com/v1/models/gemini-1.5-flash:generateContent?key=${process.env.GEMINI_API_KEY}`;
+    const prompt = `
+      Given these design project details:
+      - Design Query: "${query}"
+      - Industry: "${industry || 'Not specified'}"
+      - Design Style: "${designStyle || 'Not specified'}"
+      - Target Audience: "${audience || 'Not specified'}"
+      
+      Generate 8 related search terms that would be most useful for finding high-quality design inspiration. 
+      Each term should be specific and targeted toward professional design resources.
+      Return ONLY a comma-separated list of terms, no explanations or numbering.
+    `;
+    
+    const payload = {
+      contents: [{ parts: [{ text: prompt }] }],
+      generationConfig: {
+        temperature: 0.2,
+        topK: 40,
+        topP: 0.95,
+        maxOutputTokens: 256,
+      }
+    };
+
+    const response = await axios.post(url, payload, {
+      headers: { "Content-Type": "application/json" }
+    });
+    
+    const text = response.data.candidates?.[0]?.content?.parts?.[0]?.text || "";
+    return text.split(',').map(term => term.trim()).filter(term => term.length > 0);
+  } catch (error) {
+    console.error("❌ Related Terms API Error:", error.message);
+    return [];
+  }
+};
+
+// Enhanced color palette generator
+const generateColorPalette = async (baseColor, theme, industry) => {
+  try {
+    const url = `https://generativelanguage.googleapis.com/v1/models/gemini-1.5-flash:generateContent?key=${process.env.GEMINI_API_KEY}`;
+    const prompt = `
+      Generate a professional color palette starting with the base color ${baseColor} for use in ${industry || 'general'} design with a ${theme || 'modern'} aesthetic.
+      Return a JSON array of exactly 5 hex color codes, including the base color. Ensure the palette has:
+      - A primary color (the base color)
+      - A secondary color that complements the primary
+      - An accent color for highlights
+      - Two neutral colors for backgrounds and text
+      
+      Format your response as a JSON array ONLY, with no explanation or comments.
+      Example format: ["#FBB440", "#2B4570", "#A5E6BA", "#FFBCB5", "#2A324B"]
+    `;
+    
+    const payload = {
+      contents: [{ parts: [{ text: prompt }] }],
+      generationConfig: {
+        temperature: 0.2,
+        topK: 40,
+        topP: 0.95,
+        maxOutputTokens: 128,
+      }
+    };
+
+    const response = await axios.post(url, payload, {
+      headers: { "Content-Type": "application/json" }
+    });
+    
+    const text = response.data.candidates?.[0]?.content?.parts?.[0]?.text || "";
+    
+    // Extract the JSON array from the response
+    const match = text.match(/\[.*?\]/s);
+    if (!match) {
+      throw new Error("Invalid palette format received");
+    }
+    
+    const palette = JSON.parse(match[0]);
+    
+    // Generate color names
+    const colorNames = await Promise.all(palette.map(async (hex) => {
+      try {
+        const colorObj = color(hex);
+        return colorObj.keyword() || "Custom";
+      } catch (e) {
+        return "Custom";
+      }
+    }));
+    
+    return palette.map((hex, index) => ({
+      hex,
+      name: colorNames[index],
+      role: index === 0 ? "Primary" : 
+            index === 1 ? "Secondary" : 
+            index === 2 ? "Accent" : 
+            index === 3 ? "Neutral Light" : "Neutral Dark"
+    }));
+  } catch (error) {
+    console.error("❌ Color Palette API Error:", error.message);
+    throw error;
+  }
+};
+
+// Font pairing recommendation function
+const getFontPairings = async (designStyle, industry) => {
+  try {
+    const url = `https://generativelanguage.googleapis.com/v1/models/gemini-1.5-flash:generateContent?key=${process.env.GEMINI_API_KEY}`;
+    const prompt = `
+      Recommend 3 professional font pairings (headline + body) for a ${designStyle || 'modern'} design in the ${industry || 'general'} industry.
+      Return the results as a JSON array of objects with the following format:
+      [
+        {
+          "headlineFont": "Font Name",
+          "bodyFont": "Font Name",
+          "style": "Short description of the pairing style"
+        }
+      ]
+      
+      Only include actual font names, not generic descriptions. Focus on fonts that are commonly available or free on Google Fonts.
+      Return ONLY the JSON array, no explanations or additional text.
+    `;
+    
+    const payload = {
+      contents: [{ parts: [{ text: prompt }] }],
+      generationConfig: {
+        temperature: 0.2,
+        topK: 40,
+        topP: 0.95,
+        maxOutputTokens: 512,
+      }
+    };
+
+    const response = await axios.post(url, payload, {
+      headers: { "Content-Type": "application/json" }
+    });
+    
+    const text = response.data.candidates?.[0]?.content?.parts?.[0]?.text || "";
+    
+    // Extract the JSON array from the response
+    const match = text.match(/\[.*?\]/s);
+    if (!match) {
+      throw new Error("Invalid font pairing format received");
+    }
+    
+    return JSON.parse(match[0]);
+  } catch (error) {
+    console.error("❌ Font Pairings API Error:", error.message);
+    return [];
+  }
+};
+
+// Enhanced search API with granular filters
+app.get("/search", async (req, res) => {
+  try {
+    const { 
+      q, 
+      industry, 
+      font, 
+      color, 
+      designStyle,
+      audience,
+      purpose,
+      imageSize,
+      imageType,
+      sortBy
+    } = req.query;
+    
+    if (!q) return res.status(400).json({ error: "Query is required" });
+
+    // Get related search terms
+    const relatedTerms = await getRelatedDesignTerms(q, industry, designStyle, audience);
+    
+    // Prepare filters object
+    const filters = {
+      industry,
+      audience,
+      imageSize: imageSize || null,
+      imageType: imageType || null
+    };
+    
+    // Define queries
+    const primaryQuery = `${q} ${industry || ''} ${designStyle || ''} design inspiration`;
+    const fontQuery = font ? `${font} typography ${industry || ''} design` : null;
+    const colorQuery = color ? `${color} color palette ${designStyle || ''} design` : null;
+    
+    // Create array of search promises
+    const searchPromises = [
+      scrapeDribbble(primaryQuery, 4, color, designStyle),
+      fetchSerpAPIImages(primaryQuery, 3, color, designStyle, filters),
+      getDesignSuggestions(q, industry, font, color, designStyle, audience, purpose),
+      scrapeDesignspiration(primaryQuery, 3),
+      scrapeMuzli(primaryQuery, 2)
+    ];
+    
+    // Add Instagram scraping if appropriate
+    if (q.length > 2) {
+      searchPromises.push(scrapeInstagram(q, 2));
+    }
+    
+    // Add font-specific search if font is selected
+    if (fontQuery) {
+      searchPromises.push(fetchSerpAPIImages(fontQuery, 2, null, null, filters));
+    }
+    
+    // Add color-specific search if color is selected
+    if (colorQuery) {
+      searchPromises.push(fetchSerpAPIImages(colorQuery, 2, null, null, filters));
+    }
+    
+    // Add related term searches
+    if (relatedTerms.length > 0) {
+      // Use the first 3 related terms to expand search
+      for (let i = 0; i < Math.min(3, relatedTerms.length); i++) {
+        searchPromises.push(fetchSerpAPIImages(`${relatedTerms[i]} design inspiration`, 2, color, designStyle, filters));
+      }
+    }
+    
+    // Get font pairings if font is not specified
+    if (!font) {
+      searchPromises.push(getFontPairings(designStyle, industry));
+    }
+    
+    // Generate color palette if color is specified
+    if (color) {
+      searchPromises.push(generateColorPalette(color, designStyle, industry));
+    }
+    
+    // Execute all searches in parallel
+    const results = await Promise.allSettled(searchPromises);
+    
+    // Organize results
+    const aiSuggestions = results[2].status === 'fulfilled' ? results[2].value : "No AI suggestions available.";
+    const fontPairings = !font && results[results.length - 1].status === 'fulfilled' ? results[results.length - 1].value : [];
+    const colorPalette = color && results[results.length - 1].status === 'fulfilled' ? results[results.length - 1].value : [];
+    
+    // Combine images from different sources
+    let allImages = [];
+    for (let i = 0; i < results.length; i++) {
+      // Skip non-image results
+      if (i === 2 || 
+          (!font && i === results.length - 1) || 
+          (color && i === results.length - 1)) continue;
+      
+      if (results[i].status === 'fulfilled') {
+        allImages = [...allImages, ...results[i].value];
+      }
+    }
+    
+    // Deduplicate images based on URL
+    const uniqueImages = [];
+    const imageUrls = new Set();
+    
+    allImages.forEach(img => {
+      if (!imageUrls.has(img.image)) {
+        imageUrls.add(img.image);
+        uniqueImages.push(img);
+      }
+    });
+    
+    // Sort images if sortBy is specified
+    let sortedImages = [...uniqueImages];
+    if (sortBy === "relevance") {
+      // Sort by relevance to query
+      const queryWords = q.toLowerCase().split(' ');
+      sortedImages.sort((a, b) => {
+        const aRelevance = queryWords.filter(word => 
+          a.title.toLowerCase().includes(word)).length;
+        const bRelevance = queryWords.filter(word => 
+          b.title.toLowerCase().includes(word)).length;
+        return bRelevance - aRelevance;
+      });
+    } else if (sortBy === "source") {
+      // Sort by source (prioritize Dribbble and Behance)
+      const sourceOrder = ["Dribbble", "Behance", "Designspiration", "Muzli", "Instagram", "Google Images"];
+      sortedImages.sort((a, b) => {
+        return sourceOrder.indexOf(a.source) - sourceOrder.indexOf(b.source);
+      });
+    }
+    
+    // Return combined results
+    res.json({
+      images: sortedImages.slice(0, 12), // Increased to 12 images
+      aiSuggestions,
+      relatedTerms,
+      fontPairings,
+      colorPalette
+    });
+  } catch (error) {
+    console.error("❌ API Error:", error.message);
+    res.status(500).json({ error: "Failed to fetch design inspiration", details: error.message });
+  }
+});
+
+// Enhanced color palette API
+app.get("/color-palette", async (req, res) => {
+  try {
+    const { baseColor, theme, industry } = req.query;
+    if (!baseColor) return res.status(400).json({ error: "Base color is required" });
+    
+    const palette = await generateColorPalette(baseColor, theme, industry);
+    res.json({ palette });
+  } catch (error) {
+    console.error("❌ Color Palette API Error:", error.message);
+    res.status(500).json({ error: "Failed to generate color palette", details: error.message });
+  }
+});
+
+// New font pairing API
+app.get("/font-pairings", async (req, res) => {
+  try {
+    const { designStyle, industry } = req.query;
+    const pairings = await getFontPairings(designStyle, industry);
+    res.json({ pairings });
+  } catch (error) {
+    console.error("❌ Font Pairings API Error:", error.message);
+    res.status(500).json({ error: "Failed to get font pairings", details: error.message });
+  }
+});
+
+// New layout suggestions API
+app.get("/layout-suggestions", async (req, res) => {
+  try {
+    const { industry, designStyle, purpose } = req.query;
+    
+    const url = `https://generativelanguage.googleapis.com/v1/models/gemini-1.5-flash:generateContent?key=${process.env.GEMINI_API_KEY}`;
+    const prompt = `
+      Provide 3 specific layout suggestions for a ${designStyle || 'modern'} design in the ${industry || 'general'} industry for ${purpose || 'general use'}.
+      
+      For each layout, include:
+      1. A brief name/title for the layout
+      2. A description of the layout structure
+      3. Key elements and their positioning
+      4. Why this layout would be effective for the given industry and purpose
+      
+      Format your response as a JSON array of objects with the following format:
+      [
+        {
+          "name": "Layout name",
+          "description": "Brief description of the layout",
+          "elements": ["Key element 1", "Key element 2", "Key element 3"],
+          "reasoning": "Why this layout is effective"
+        }
+      ]
+      
+      Return ONLY the JSON array, no explanations or additional text.
+    `;
+    
+    const payload = {
+      contents: [{ parts: [{ text: prompt }] }],
+      generationConfig: {
+        temperature: 0.2,
+        topK: 40,
+        topP: 0.95,
+        maxOutputTokens: 1024,
+      }
+    };
+
+    const response = await axios.post(url, payload, {
+      headers: { "Content-Type": "application/json" }
+    });
+    
+    const text = response.data.candidates?.[0]?.content?.parts?.[0]?.text || "";
+    
+    // Extract the JSON array from the response
+    const match = text.match(/\[.*?\]/s);
+    if (!match) {
+      throw new Error("Invalid layout suggestions format received");
+    }
+    
+    const layouts = JSON.parse(match[0]);
+    res.json({ layouts });
+  } catch (error) {
+    console.error("❌ Layout Suggestions API Error:", error.message);
+    res.status(500).json({ error: "Failed to get layout suggestions", details: error.message });
+  }
+});
+
+// API Route for trend analysis
+app.get("/design-trends", async (req, res) => {
+  try {
+    const { industry } = req.query;
+    
+    const url = `https://generativelanguage.googleapis.com/v1/models/gemini-1.5-flash:generateContent?key=${process.env.GEMINI_API_KEY}`;
+    const prompt = `
+      Provide an analysis of current design trends in the ${industry || 'general'} industry.
+      
+      Include:
+      1. Top 5 visual design trends
+      2. Top 3 typography trends
+      3. Top 3 color palette trends
+      4. Top 3 layout and UI trends
+      
+      Format your response as a JSON object with the following structure:
+      {
+        "visualTrends": [
+          {"name": "Trend name", "description": "Brief description of the trend"}
+        ],
+        "typographyTrends": [
+          {"name": "Trend name", "description": "Brief description of the trend"}
+        ],
+        "colorTrends": [
+          {"name": "Trend name", "description": "Brief description of the trend"}
+        ],
+        "layoutTrends": [
+          {"name": "Trend name", "description": "Brief description of the trend"}
+        ]
+      }
+      
+      Return ONLY the JSON object, no explanations or additional text.
+    `;
+    
+    const payload = {
+      contents: [{ parts: [{ text: prompt }] }],
+      generationConfig: {
+        temperature: 0.2,
+        topK: 40,
+        topP: 0.95,
+        maxOutputTokens: 1024,
+      }
+    };
+
+    const response = await axios.post(url, payload, {
+      headers: { "Content-Type": "application/json" }
+    });
+    
+  const text = response.data.candidates?.[0]?.content?.parts?.[0]?.text || "";
+    
+    // Extract the JSON object from the response
+    const match = text.match(/\{.*\}/s);
+    if (!match) {
+      throw new Error("Invalid trends format received");
+    }
+    
+    const trends = JSON.parse(match[0]);
+    res.json({ trends });
+  } catch (error) {
+    console.error("❌ Design Trends API Error:", error.message);
+    res.status(500).json({ error: "Failed to get design trends", details: error.message });
+  }
+});
+
+// API Route for accessibility recommendations
+app.get("/accessibility-recommendations", async (req, res) => {
+  try {
+    const { colorPalette, industry, audience } = req.query;
+    
+    const url = `https://generativelanguage.googleapis.com/v1/models/gemini-1.5-flash:generateContent?key=${process.env.GEMINI_API_KEY}`;
+    const prompt = `
+      Provide accessibility recommendations for a design with these colors: ${colorPalette || '#FFFFFF,#000000'}
+      in the ${industry || 'general'} industry for ${audience || 'general audience'}.
+      
+      Include:
+      1. Color contrast analysis and recommendations
+      2. Typography accessibility recommendations
+      3. Layout and navigation accessibility considerations
+      4. Interactive element accessibility guidelines
+      
+      Format your response as a JSON object with the following structure:
+      {
+        "colorContrast": [
+          {"recommendation": "Recommendation text", "importance": "High/Medium/Low"}
+        ],
+        "typography": [
+          {"recommendation": "Recommendation text", "importance": "High/Medium/Low"}
+        ],
+        "layout": [
+          {"recommendation": "Recommendation text", "importance": "High/Medium/Low"}
+        ],
+        "interaction": [
+          {"recommendation": "Recommendation text", "importance": "High/Medium/Low"}
+        ]
+      }
+      
+      Return ONLY the JSON object, no explanations or additional text.
+    `;
+    
+    const payload = {
+      contents: [{ parts: [{ text: prompt }] }],
+      generationConfig: {
+        temperature: 0.2,
+        topK: 40,
+        topP: 0.95,
+        maxOutputTokens: 1024,
+      }
+    };
+
+    const response = await axios.post(url, payload, {
+      headers: { "Content-Type": "application/json" }
+    });
+    
+    const text = response.data.candidates?.[0]?.content?.parts?.[0]?.text || "";
+    
+    // Extract the JSON object from the response
+    const match = text.match(/\{.*\}/s);
+    if (!match) {
+      throw new Error("Invalid accessibility recommendations format received");
+    }
+    
+    const recommendations = JSON.parse(match[0]);
+    res.json({ recommendations });
+  } catch (error) {
+    console.error("❌ Accessibility Recommendations API Error:", error.message);
+    res.status(500).json({ error: "Failed to get accessibility recommendations", details: error.message });
+  }
+});
+
+// New function to scrape Instagram hashtag trends
+const scrapeInstagramTrends = async (query, limit = 5) => {
+  if (!browser) await initBrowser();
+  
+  try {
+    // Clean the query to create a valid hashtag
+    const hashtag = query.replace(/[^a-zA-Z0-9]/g, '').toLowerCase();
+    if (!hashtag) return [];
+    
+    const page = await browser.newPage();
+    await page.setUserAgent('Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/91.0.4472.124 Safari/537.36');
+    
+    const url = `https://www.instagram.com/explore/tags/${encodeURIComponent(hashtag)}/`;
+    await page.goto(url, { waitUntil: 'networkidle2', timeout: 30000 });
+    
+    // Wait for content to load and scroll to trigger lazy loading
+    await page.waitForSelector('article img', { timeout: 10000 }).catch(() => {});
+    
+    // Scroll down to load more content
+    await page.evaluate(() => {
+      window.scrollBy(0, 1500);
+    });
+    
+    await page.waitForTimeout(2000);
+    
+    // Extract images and post info
+    const results = await page.evaluate((limit) => {
+      const posts = document.querySelectorAll('article img');
+      const data = [];
+      
+      for (let i = 0; i < Math.min(posts.length, limit); i++) {
+        const post = posts[i];
+        const image = post.src;
+        const alt = post.alt || 'Instagram Design Inspiration';
+        
+        // Find the post link
+        let link = '';
+        const linkElement = post.closest('a');
+        if (linkElement) {
+          link = linkElement.href;
+        }
+        
+        // Only add if we have an image
+        if (image) {
+          data.push({ 
+            image, 
+            title: alt,
+            link,
+            source: "Instagram"
+          });
+        }
+      }
+      
+      // Extract related hashtags
+      const relatedTags = [];
+      const tagElements = document.querySelectorAll('.xil3uk8');
+      for (let i = 0; i < Math.min(tagElements.length, 5); i++) {
+        const tag = tagElements[i].textContent.trim();
+        if (tag.startsWith('#')) {
+          relatedTags.push(tag.substring(1));
+        }
+      }
+      
+      return {
+        posts: data,
+        relatedTags
+      };
+    }, limit);
+    
+    await page.close();
+    return results;
+  } catch (error) {
+    console.error("❌ Instagram Trends Scraping Error:", error.message);
+    return { posts: [], relatedTags: [] };
+  }
+};
+
+// API Route for Instagram trends
+app.get("/instagram-trends", async (req, res) => {
+  try {
+    const { query } = req.query;
+    if (!query) return res.status(400).json({ error: "Query is required" });
+    
+    const trends = await scrapeInstagramTrends(query);
+    res.json(trends);
+  } catch (error) {
+    console.error("❌ Instagram Trends API Error:", error.message);
+    res.status(500).json({ error: "Failed to get Instagram trends", details: error.message });
+  }
+});
+
+// Brand guidelines generator
+app.get("/brand-guidelines", async (req, res) => {
+  try {
+    const { 
+      brandName,
+      industry, 
+      values,
+      audience,
+      colorPalette,
+      designStyle
+    } = req.query;
+    
+    if (!brandName) return res.status(400).json({ error: "Brand name is required" });
+    
+    const url = `https://generativelanguage.googleapis.com/v1/models/gemini-1.5-flash:generateContent?key=${process.env.GEMINI_API_KEY}`;
+    const prompt = `
+      Generate brief brand guidelines for "${brandName}" with these details:
+      - Industry: ${industry || 'Not specified'}
+      - Brand Values: ${values || 'Not specified'}
+      - Target Audience: ${audience || 'Not specified'}
+      - Color Palette: ${colorPalette || 'Not specified'}
+      - Design Style: ${designStyle || 'Not specified'}
+      
+      Include:
+      1. Brand Persona (voice and tone)
+      2. Logo Usage Guidelines (placement, spacing, dos and don'ts)
+      3. Typography Recommendations (fonts, sizes, hierarchy)
+      4. Color Usage (primary, secondary, accent colors and their applications)
+      5. Visual Elements (image style, icon style, patterns)
+      
+      Format your response as markdown with clear sections and concise guidelines that a designer could implement.
+    `;
+    
+    const payload = {
+      contents: [{ parts: [{ text: prompt }] }],
+      generationConfig: {
+        temperature: 0.3,
+        topK: 40,
+        topP: 0.95,
+        maxOutputTokens: 2048,
+      }
+    };
+
+    const response = await axios.post(url, payload, {
+      headers: { "Content-Type": "application/json" }
+    });
+    
+    const guidelines = response.data.candidates?.[0]?.content?.parts?.[0]?.text || "";
+    res.json({ guidelines });
+  } catch (error) {
+    console.error("❌ Brand Guidelines API Error:", error.message);
+    res.status(500).json({ error: "Failed to generate brand guidelines", details: error.message });
+  }
+});
+
+// Graceful shutdown function to close browser
+process.on('SIGINT', async () => {
+  console.log('Closing browser before exit...');
+  if (browser) await browser.close();
+  process.exit();
+});
+
+process.on('SIGTERM', async () => {
+  console.log('Closing browser before exit...');
+  if (browser) await browser.close();
+  process.exit();
+});
+
+// API health check endpoint
+app.get("/health", (req, res) => {
+  res.json({ status: "ok", version: "1.2.0" });
+});
+
+const PORT = process.env.PORT || 3000;
+app.listen(PORT, () => console.log(`✅ Enhanced Design Inspiration Server running on port ${PORT}`));

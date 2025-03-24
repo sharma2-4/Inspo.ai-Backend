@@ -6,7 +6,18 @@ import cors from 'cors';
 dotenv.config();
 
 const app = express();
-app.use(cors());
+app.use(
+  cors({
+    origin: [
+      "https://inspo-ai-frontend.vercel.app",
+      "http://localhost:5173",
+    ],
+    methods: ["GET", "POST", "PUT", "DELETE", "OPTIONS"],
+    allowedHeaders: ["Content-Type", "Authorization"],
+    credentials: true,
+  })
+);
+
 app.use(express.json());
 
 if (!process.env.GEMINI_API_KEY || !process.env.SERPAPI_KEY || !process.env.FREEPIK_API_KEY) {

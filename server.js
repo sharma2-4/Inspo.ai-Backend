@@ -346,7 +346,7 @@ const getDesignSuggestions = async (query, industry, font, colorHex, designStyle
       3. Element - purpose and impact
       4. Element - purpose and impact
       
-      ## LAYOUT SUGGESTIONS
+      # LAYOUT SUGGESTIONS
       1. Specific layout for ${industry || 'this industry'} - description
       2. Specific layout for ${industry || 'this industry'} - description
       3. Specific layout for ${industry || 'this industry'} - description

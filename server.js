@@ -9,7 +9,7 @@ const app = express();
 app.use(
   cors({
     origin: [
-      "https://inspo-ai-frontend.vercel.app",
+      "https://inspo-ai.vercel.app/",
       "http://localhost:5173",
     ],
     methods: ["GET", "POST", "PUT", "DELETE", "OPTIONS"],
